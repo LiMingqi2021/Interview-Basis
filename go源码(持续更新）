@@ -1,0 +1,191 @@
+Map底层实现？
+// Go map的一个header结构
+type hmap struct {
+    count     int // map的大小.  len()函数就取的这个值
+    flags     uint8 //map状态标识 1 并发写
+    B         uint8  // 可以最多容纳 6.5 * 2 ^ B 个元素，6.5为装载因子即:map长度=6.5*2^B
+                    //B可以理解为buckets已扩容的次数
+    noverflow uint16 // 溢出buckets的数量
+    hash0     uint32 // hash 种子
+ 
+    buckets    unsafe.Pointer //指向最大2^B个Buckets数组的指针. count==0时为nil.
+    oldbuckets unsafe.Pointer //指向扩容之前的buckets数组，并且容量是现在一半.不增长就为nil
+    nevacuate  uintptr  // 搬迁进度，小于nevacuate的已经搬迁
+    extra *mapextra // 可选字段，额外信息
+}
+ 
+//额外信息
+ type mapextra struct {
+     overflow    *[]*bmap
+     oldoverflow *[]*bmap
+ 
+     nextOverflow *bmap
+ }
+ 
+ //在编译期间会产生新的结构体，bucket
+ type bmap struct {
+     tophash [8]uint8 //存储哈希值的高8位
+     data    byte[1]  //key value数据:key/key/key/.../value/value/value...
+     overflow *bmap   //溢出bucket的地址
+ }
+
+
+map类型的变量本质上是一个指针，指向 *hmap 结构体
+表示map的结构体是hmap，hashmap的缩写，hmap里维护着若干个bucket数组 (即桶数组)
+Bucket数组中每个元素都是bmap结构，也即每个bucket（桶）都是bmap结构，每个桶中保存了8个kv对，如果8个满了，又来了一个key落在了这个桶里，会使用overflow连接下一个桶(溢出桶)
+hmap：
+buckets中包含了哈希中最小细粒度单元bucket桶，数据通过hash函数均匀的分布在各个bucket中，buckets这个参数，它存储的是指向buckets数组的一个指针，当bucket(桶为0时)为nil。我们可以理解为，hmap指向了一个空bucket数组
+makemap返回的是一个指针*hmap，makeslice 返回的是一个结构体 slice
+
+Map 查找
+k4的get流程可以归纳为如下几步：
+①计算k4的hash值。[由于当前主流机都是64位操作系统，所以计算结果有64个比特位]
+②通过最后的“B”位来确定在哪号桶，此时B为4，所以取k4对应哈希值的后4位，也就是0101，0101用十进制表示为5，所以在5号桶）
+③根据k4对应的hash值前8位快速确定是在这个桶的哪个位置（额外说明一下，在bmap中存放了每个key对应的tophash，是key的哈希值前8位),一旦发现前8位一致，则会执行下一步
+④对比key完整的hash是否匹配，如果匹配则获取对应value
+⑤如果都没有找到，就去连接的下一个溢出桶中找（overflow）不为空
+
+新元素插入过程如下：
+根据key值算出哈希值
+取哈希值低位与hmap.B取模确定bucket位置
+查找该key是否已经存在，如果存在则直接更新值
+如果没找到将key，将key插入
+ 1.算出hash值2.取高低位hash值
+ 2.通过低位hash找到对应bucket桶，再通过高位hash找到对应key值（此处可能有hash冲突和扩容），
+查找hahs冲突：若找到对应高位hash值，但key值不一致，则线性向下或通过扩展指针(数组到末尾了)查找key值。
+插入hash冲突：先查找，若存在重复高位hash值，则线性向下寻空位插入。若当前kv数组已满，则扩展bucket，插入
+
+渐进式扩容
+扩容的前提条件
+为了保证访问效率，当新元素将要添加进map时，都会检查是否需要扩容，扩容实际上是以空间换时间的手段。
+触发扩容的条件有二个：
+负载因子 > 6.5时，也即平均每个bucket存储的键值对达到6.5个。
+当overflow溢出桶过多时：
+当 B < 15 时，如果overflow的bucket数量超过 2^B。
+当 B >= 15 时，overflow的bucket数量超过 2^15。
+简单来讲，新加入key的hash值后B位都一样，使得个别桶一直在插入新数据，进而导致它的溢出桶链条越来越长。如此一来，当map在操作数据时，扫描速度就会变得很慢。及时的扩容，可以对这些元素进行重排，使元素在桶的位置更平均一些。
+
+第一个：增量扩容
+这种2倍扩容是由于当前桶数组确实不够用了，发生这种扩容时，元素会重排，可能会发生桶迁移。
+当负载因子过大时，就新建一个bucket，新的bucket长度是原来的2倍，然后旧bucket数据搬迁到新的bucket。
+考虑到如果map存储了数以亿计的key-value，一次性搬迁将会造成比较大的延时，Go采用逐步搬迁策略，即每次访问map时都会触发一次搬迁，每次搬迁2个键值对。
+本B=0，其溢出桶上限也为2^0 =1,触发条件进行buckets扩容，则根据后B位hash值进行元素重排
+
+第二个的话：等量扩容
+由于map中不断的put和delete key，桶中可能会出现很多断断续续的空位，这些空位会导致连接的bmap溢出桶很长，导致扫描时间边长。这种扩容实际上是一种整理，把后置位的数据整理到前面。这种情况下，元素会发生重排，但不会换桶。
+Map线程安全吗？
+不安全，发现写置位等于1，直接panic
+Go语言中的 map 在并发情况下，只读是线程安全的，同时读写是线程不安全的。
+因为map变量为 指针类型变量，并发写时，多个协程同时操作一个内存，类似于多线程操作同一个资源会发生竞争关系，共享资源会遭到破坏，因此golang 出于安全的考虑，抛出致命错误：fatal error: concurrent map writes
+
+Go中的map是一个指针，占用8个字节，指向hmap结构体; 源码src/runtime/map.go中可以看到map的底层结构
+golang 有三个常用的高级类型slice、map、channel, 它们都是引用类型，当引用类型作为函数参数时，可能会修改原内容数据。
+golang 中没有引用传递，只有值和指针传递。
+解决方案
+（1）	在写操作的时候增加锁，删除时候除了加锁外，还需要增加断言避免出现错误
+ 
+（2）sync.Map包
+ 
+sync.map 对 map 的读写，不需要加锁。通过空间换时间的方式，使用 read 和 dirty 两个 map 来进行读写分离，降低锁时间来提高效率
+1、sync.Map 的实现原理可概括为：
+       a、过 read 和 dirty 两个字段将读写分离，读的数据存在只读字段 read 上，将最新写入的数据则存在 dirty 字段上
+       b、读取时会先查询 read，不存在再查询 dirty，写入时则只写入 dirty
+       c、读取 read 并不需要加锁，而读或写 dirty 都需要加锁
+       d、另外有 misses 字段来统计 read 被穿透的次数（被穿透指需要读 dirty 的情况），超过一定次数则将 dirty 数据同步到 read 上
+       e、对于删除数据则直接通过标记来延迟删除
+type Map struct {
+ mu Mutex
+ read atomic.Value // readOnly
+ dirty map[interface{}]*entry
+ misses int
+}
+ 
+// Map.read 属性实际存储的是 readOnly。
+type readOnly struct {
+ m       map[interface{}]*entry
+ amended bool
+}
+mu: 互斥锁，保护 read 和 dirty
+read: 只读数据，指出并发读取 (atomic.Value 类型) 。如果需要更新 read，需要加锁保护数据安全。
+read 实际存储的是 readOnly 结构体，内部是一个原生 map，amended 属性用于标记 read 和 dirty 的数据是否一致
+dirty: 读写数据，非线性安全的原生 map。包含新写入的 key，并且包含 read 中所有未被删除的 key。
+misses: 统计有多少次读取 read 没有被命中。每次 read 读取失败后，misses 的计数加 1。
+
+sync.map 适用于读多写少的场景。对于写多的场景，会导致 read map 缓存失效，需要加锁，导致冲突变多；而且由于未命中 read map 次数过多，导致 dirty map 提升为 read map，这是一个 O(N) 的操作，会进一步降低性能。
+比较map相等？
+1）	都为nil
+2）	非空，长度相等，指向同一个map实体对象
+3）	Key对应的value深度相等
+Map1 == map2 只能比较是否为nil
+
+Context底层实现 /src/context/context.go
+Go 1.7 标准库引入 context，中文译作“上下文”，准确说它是 goroutine 的上下文，包含 goroutine 的运行状态、环境、现场等信息。
+context 主要用来在 goroutine 之间传递上下文信息，包括：取消信号、超时时间、截止时间、k-v 等。
+context.Context 类型的值可以协调多个 groutine 中的代码执行“取消”操作，并且可以存储键值对。最重要的是它是并发安全的。
+与它协作的 API 都可以由外部控制执行“取消”操作，例如：取消一个 HTTP 请求的执行。
+https://blog.csdn.net/weixin_40580582/article/details/118661270
+
+https://cloud.tencent.com/developer/article/1900658
+使用官方建议:
+1,不要将context塞到结构体里，直接将context作为第一个参数，明明ctx
+2,不要传入nil context，context:todo
+3,不要把本应该作为参数的类型塞到context中，context应存储共同的数据，如session,cookie
+4,同一个context可能会传递到多个goroutine，context并发安全
+context的底层设计，我们可以概括为1个接口，4种实现与6个方法。
+
+1 个接口
+Context 规定了context的四个基本方法
+4 种实现
+emptyCtx 实现了一个空的context，可以用作根节点
+cancelCtx 实现一个带cancel功能的context，可以主动取消
+timerCtx 实现一个通过定时器timer和截止时间deadline定时取消的context
+valueCtx 实现一个可以通过 key、val 两个字段来存数据的context
+6 个方法
+Background 返回一个emptyCtx作为根节点
+TODO 返回一个emptyCtx作为未知节点
+WithCancel 返回一个cancelCtx
+WithDeadline 返回一个timerCtx
+WithTimeout 返回一个timerCtx
+WithValue 返回一个valueCtx
+
+创建context
+这两个函数其实只是互为别名，没有差别，官方给的定义是：
+•	context.Background 是上下文的默认值，所有其他的上下文都应该从它衍生（Derived）出来。
+•	context.TODO 应该只在不确定应该使用哪种上下文时使用；
+
+type cancelCtx struct {
+    Context
+
+    mu       sync.Mutex            // protects following fields
+    done     chan struct{}         // created lazily, closed by first cancel call
+    children map[canceler]struct{} // set to nil by the first cancel call
+    err      error                 // set to non-nil by the first cancel call
+}
+可以发现写数据的时候必须创建新的子 context, 示例程序中是在主 goroutine 中进行的, 而读数据是在 worker goroutine 中进行的，若读不到则在父 context 中读数据； worker 中传入的 ctx 需要先创建， 可以认为读和写是有前后关系的，且存在多个 goroutine 并发读, 不存在goroutine 并发读写的情况， 所以 context 是并发安全的;
+.1 使用场景
+•	超时控制
+•	错误取消
+•	跨 goroutine 数据同步
+•	防止 goroutine 泄漏
+slice底层实现
+type slice struct {
+	array unsafe.Pointer
+	len int
+	cap int
+}
+slice扩容
+若 slice 空间不足则会发生扩容，扩容会重新分配一块更大的内存，将原 slice 拷贝到新 slice ，然后返回新 slice。扩容后再将数据追加进去。
+
+1.Go1.17源码分析slice扩容规则
+代码的扩容策略可以简述为以下三个规则：
+1.当期望容量 > 两倍的旧容量时，直接使用期望容量作为新切片的容量
+2.如果旧容量 < 1024（注意这里单位是元素个数）,那么直接翻倍旧容量
+3.如果旧容量 > 1024，那么会进入一个循环，每次增加25%直到大于期望容量
+
+2,到了Go1.18时，又改成不和1024比较了，而是和256比较；并且扩容的增量也有所变化，不再是每次扩容1/4，如下代码所示：
+
+ 
+在1.18中，优化了切片扩容的策略2，让底层数组大小的增长更加平滑：
+通过减小阈值并固定增加一个常数，使得优化后的扩容的系数在阈值前后不再会出现从2到1.25的突变，该commit作者给出了几种原始容量下对应的“扩容系数”：
+ 
+
